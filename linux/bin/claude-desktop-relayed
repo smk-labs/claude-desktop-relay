@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# Claude Desktop, pointed at the relay.
+#
+# A wrapper, not a replacement. The isolated launcher underneath holds the X
+# display guard and the CLAUDE_CONFIG_DIR isolation, and neither is ours to
+# reimplement: this adds exactly two things to its environment and then gets out
+# of the way.
+#
+#   1. The proxy address, in every case and every scheme. Case matters: the login
+#      shell exports lowercase names and HTTP clients read those first, so setting
+#      only HTTPS_PROXY looks right in `env` and does nothing.
+# The certificate is deliberately NOT handed over here. Measured on this box on
+# 2026-08-25: the packaged Electron app does not see NODE_EXTRA_CA_CERTS from its
+# own environment, and wrote its CA bundle with 485 certificates and ours absent
+# while it was set. A plain `node` process on the same machine does see it, which
+# is the measurement that misleads. It goes through the app's own encrypted store
+# instead, which `relay-linux trust` writes and `relay-linux launch` writes for
+# you before it gets here.
+set -euo pipefail
+
+ROOT="${CLAUDE_DESKTOP_TRIAL_ROOT:-$HOME/desktop-trial}"
+RELAY_HOME="${CLAUDE_RELAY_HOME:-$HOME/.claude-desktop-relay}"
+PORT="${CLAUDE_RELAY_PORT:-8978}"
+CA="$RELAY_HOME/ca/ca.crt"
+AT="http://127.0.0.1:$PORT"
+
+# The certificate has to exist even though it is not exported here: the store the
+# app reads names this path, and a Window pointed at a path with no file behind it
+# fails every Code session with a handshake error.
+[ -f "$CA" ] || { echo "No certificate at $CA. Start the relay once first: relay-linux serve" >&2; exit 1; }
+
+# Refuse rather than start a Window that cannot reach the relay: a Window pointed
+# at a dead port fails every request instead of falling back, and the reason would
+# not be visible anywhere the user is looking.
+if ! (exec 3<>/dev/tcp/127.0.0.1/"$PORT") 2>/dev/null; then
+  echo "Nothing is listening on $AT, so a Code session would have nowhere to go." >&2
+  echo "Start it first:  relay-linux serve" >&2
+  exit 1
+fi
+
+export HTTPS_PROXY="$AT" https_proxy="$AT" HTTP_PROXY="$AT" http_proxy="$AT" ALL_PROXY="$AT" all_proxy="$AT"
+export NO_PROXY="localhost,127.0.0.1,::1,.local" no_proxy="localhost,127.0.0.1,::1,.local"
+
+exec "$ROOT/bin/claude-desktop-trial" "$@"

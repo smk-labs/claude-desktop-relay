@@ -1,0 +1,11 @@
+node_modules/
+*.log
+.DS_Store
+ca/
+*.key
+*.crt
+*.pem
+seats.json
+dist/
+*.zip.enc
+.claude/
