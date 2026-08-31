@@ -111,19 +111,64 @@ export function readSocksProxy(text: string): Address | null {
   return { host, port };
 }
 
+/**
+ * How long the machine has to say what proxy it uses.
+ *
+ * A healthy `scutil --proxy` answers in about ten milliseconds, measured on
+ * 2026-08-30, so two seconds is two hundred times the honest cost and this only
+ * fires when something is genuinely wrong.
+ *
+ * It exists because this command is asked for from inside a relay turn, and a
+ * turn is one of twelve. `scutil` reads the SystemConfiguration store, which a
+ * VPN rewrites every time it changes a route, and a read of a store mid-rewrite
+ * can block. Without a clock that block is permanent: the promise below settles
+ * only on `close` or `error`, so twelve of them take every turn the relay has and
+ * nothing is ever written to say why. That is the wedge of 2026-08-30, which took
+ * a restart to clear and left an empty log behind it.
+ */
+export const THE_MACHINE_HAS_THIS_LONG = 2_000;
+
 /** Ask the machine how traffic leaves. The reading `serve` actually uses. */
 export function machineEgress(): Promise<Egress> {
   if (ON_WINDOWS) return windowsEgress();
   return new Promise<Egress>((resolve) => {
     const child = spawn("scutil", ["--proxy"], { stdio: ["ignore", "pipe", "ignore"] });
     let out = "";
+    let settled = false;
+
+    /**
+     * Answered once, whichever of the three ways gets here first.
+     *
+     * The clock and the process can both fire, and a second answer to a promise
+     * is silent rather than wrong, so this is guarded here to say plainly that
+     * only the first one counts.
+     */
+    const answer = (egress: Egress) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(clock);
+      resolve(egress);
+    };
+
+    /**
+     * SIGKILL rather than SIGTERM, because the case being killed is a process
+     * stuck in a system call, and that is the one a polite signal does not reach.
+     */
+    const clock = setTimeout(() => {
+      child.kill("SIGKILL");
+      answer({
+        kind: "refuse",
+        why: `this machine did not say what proxy it uses within ${THE_MACHINE_HAS_THIS_LONG}ms`,
+      });
+    }, THE_MACHINE_HAS_THIS_LONG);
+
     child.stdout.on("data", (chunk: Buffer) => (out += chunk.toString("utf8")));
     // A machine that will not answer is not a machine with no proxy. Refusing is
     // the safe reading: going direct on the strength of a failed command is how a
     // bypass gets in without anybody choosing it.
-    child.on("error", () => resolve({ kind: "refuse", why: "this machine would not say what proxy it uses" }));
+    child.on("error", () => answer({ kind: "refuse", why: "this machine would not say what proxy it uses" }));
     child.on("close", (code) =>
-      resolve(
+      answer(
         code === 0
           ? machineEgressFrom(out)
           : { kind: "refuse", why: `this machine would not say what proxy it uses (scutil exited ${String(code)})` },

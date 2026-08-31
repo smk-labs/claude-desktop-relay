@@ -155,8 +155,17 @@ lists the Seats and deliberately holds no credential.
 ```powershell
 relay check-secret-store        # prove the round trip against the real thing
 relay back-up-seats             # take a backup, after every sitting that fills a Seat
-relay back-up-seats --restore   # put one back
+relay back-up-seats --restore   # put one back, Seats and logins together
+relay back-up-seats --no-logins # the Send tokens only
 ```
+
+It carries the **Stats logins** as well, and that is what makes an archive enough to
+move to another machine. A Send token pays and can say nothing about a plan: every
+plan name, every Multiplier and every idle Seat's usage is read from a claude.ai
+session instead, and those sessions live inside Claude Desktop profiles that do not
+travel. An archive of tokens alone restores a machine that bills correctly and reads
+"not known" on every row. A Stats login is a credential too, so it is inside the same
+cipher under the same passphrase and never beside it. `--no-logins` leaves them out.
 
 The backup is one AES-256-CBC archive under a passphrase you choose, written to
 `C:\Users\me\.claude-legacy-backup\send-tokens\` with a plain note beside it saying what

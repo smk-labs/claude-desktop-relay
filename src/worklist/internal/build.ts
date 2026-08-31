@@ -135,22 +135,48 @@ export function buildWorklist(options: {
   wanted: readonly Seat[];
   held: readonly ListedSeat[];
 }): Worklist {
+  /**
+   * One Seat read twice is one Seat, and it is the ordinary case now.
+   *
+   * A name is derived from the account and the Organization (ADR 0010), so the
+   * same pair read from two Stats logins derives the same name by construction.
+   * That used to be impossible because there was one place logins came from.
+   * There are three now, and an account signed into a Window here and also
+   * present in the snapshot folder is read from both, which made the flow refuse
+   * to do anything at all until somebody renamed a Seat by hand. Refusing to run
+   * because two sources agree is the wrong answer.
+   *
+   * A genuine collision is still refused, and it is a different thing: the same
+   * derived name for a different account or a different Organization. That one
+   * would overwrite a Send token, which is what ADR 0010 is guarding.
+   */
   const seen = new Map<string, Seat>();
+  const wanted: Seat[] = [];
   for (const seat of options.wanted) {
     const clash = seen.get(seat.name);
     if (clash !== undefined) {
-      throw new Error(
-        `two Seats would both be called "${seat.name}": ${clash.account} in ${clash.organization.id}, ` +
-          `and ${seat.account} in ${seat.organization.id}. One would overwrite the other's Send token, ` +
-          `so nothing has been done. Rename one of them in the Worklist file and run this again.`,
-      );
+      if (clash.account !== seat.account || clash.organization.id !== seat.organization.id) {
+        throw new Error(
+          `two Seats would both be called "${seat.name}": ${clash.account} in ${clash.organization.id}, ` +
+            `and ${seat.account} in ${seat.organization.id}. One would overwrite the other's Send token, ` +
+            `so nothing has been done. Rename one of them in the Worklist file and run this again.`,
+        );
+      }
+      // The same Seat from a second source. A measured Multiplier beats a
+      // stand-in, because one of the two readings may have been unable to say.
+      if (clash.multiplier === WHEN_UNKNOWN && seat.multiplier !== WHEN_UNKNOWN) {
+        seen.set(seat.name, seat);
+        wanted[wanted.indexOf(clash)] = seat;
+      }
+      continue;
     }
     seen.set(seat.name, seat);
+    wanted.push(seat);
   }
 
   const filled = new Set(options.held.filter((seat) => seat.hasSendToken).map((seat) => seat.name));
 
-  const entries = inTheOrderToFillThem(options.wanted).map((seat) => ({
+  const entries = inTheOrderToFillThem(wanted).map((seat) => ({
     seat,
     filled: filled.has(seat.name),
   }));

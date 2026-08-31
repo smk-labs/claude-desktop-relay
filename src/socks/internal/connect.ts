@@ -113,6 +113,14 @@ async function skipTheBoundAddress(socket: Socket, kind: number): Promise<void> 
 }
 
 /**
+ * How long a SOCKS proxy has to complete the whole handshake.
+ *
+ * The same eight seconds the HTTP proxy path allows, and for the same reason:
+ * it covers accept-then-silence, not just the connect.
+ */
+export const THE_SOCKS_PROXY_HAS_THIS_LONG = 8_000;
+
+/**
  * Open a tunnel to `host:port` through a SOCKS5 proxy, and hand back the socket.
  *
  * The host is sent as a name rather than resolved here, so the proxy does the
@@ -126,12 +134,35 @@ export async function socksConnect(options: {
   readonly credentials?: SocksCredentials | null;
   /** Injected so a test never opens a socket of its own making. */
   readonly open?: (port: number, host: string) => Socket;
+  /** How long the proxy has for the whole handshake. Only a test moves it. */
+  readonly patience?: number;
 }): Promise<Socket> {
   const socket = (options.open ?? ((port, host) => connect(port, host)))(
     options.through.port,
     options.through.host,
   );
   socket.setNoDelay(true);
+
+  /**
+   * The clock the HTTP proxy path has had since 2026-08-23, in the one egress
+   * that never got it.
+   *
+   * A SOCKS proxy that accepts the connection and then says nothing left every
+   * step below waiting for ever: `once(socket, "connect")` settles on nothing but
+   * a connection or an error, and `exactly` waits on bytes that never come. That
+   * is the same silent hang a VPN under load produced on the HTTP path, and it is
+   * likelier here, because a machine that names a SOCKS proxy is a machine
+   * running the kind of client that does this.
+   *
+   * Destroyed WITH a reason rather than bare, because a bare destroy emits no
+   * `error`, and `once(socket, "connect")` would go on waiting through it.
+   */
+  const patience = options.patience ?? THE_SOCKS_PROXY_HAS_THIS_LONG;
+  const clock = setTimeout(() => {
+    socket.destroy(
+      new Error(`the SOCKS proxy at ${options.through.host}:${options.through.port} did not answer within ${patience}ms`),
+    );
+  }, patience);
 
   try {
     await once(socket, "connect");
@@ -197,5 +228,10 @@ export async function socksConnect(options: {
   } catch (error) {
     socket.destroy();
     throw error;
+  } finally {
+    // Cleared on every way out, including the good one: the tunnel that follows
+    // is long-lived, and a clock left running would cut it at the handshake's
+    // patience rather than at the exchange's.
+    clearTimeout(clock);
   }
 }

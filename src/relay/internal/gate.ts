@@ -12,6 +12,15 @@
  * That is congestion collapse, and the cure for congestion collapse is never a
  * bigger timeout. It is asking for less at once. A queue here costs a request a
  * short wait; no queue costs it the whole request.
+ *
+ * **Corrected 2026-08-30: what this bounds.** As first written this held its turn
+ * until the last byte of the reply, and the sentence below about the queue
+ * draining "in the time one exchange takes" was the assumption that broke. An
+ * exchange takes about thirty seconds on this traffic, so twelve turns was a
+ * ceiling of roughly 1,400 requests an hour, and 14.3% of all requests died
+ * waiting for one. The turn now covers the dial, the request and the wait for the
+ * head, which is the whole of the quiet stretch that collapses a route, and a
+ * second looser bound covers the streaming that follows. ADR 0017.
  */
 export type Gate = {
   /**

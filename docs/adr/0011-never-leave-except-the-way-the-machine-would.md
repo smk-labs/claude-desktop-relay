@@ -91,3 +91,44 @@ The whole handshake now has eight seconds. A proxy on loopback answers in
 milliseconds, so this is not a performance limit; it is the line between "busy"
 and "not coming back". A test drives a proxy that accepts and never answers, and
 without the clock that test does not finish.
+
+
+## The rule had a second caller nobody told it about, 2026-08-30
+
+Everything above is written as though the relay were the only thing in this
+program that talks to Anthropic. It was not. The background usage refresher, which
+asks each stale Seat what it has spent, built its own request with `node:https`,
+no agent and no proxy, and put that Seat's Send token in the header. Four of those
+at a time, every quarter of an hour, unattended.
+
+So the consequence stated above, that anything dialling the upstream goes through
+one function, was true of `src/relay` and false of the program. The chokepoint
+test proved the relay, and there was nothing standing where the second caller was.
+On the machine this was built on, a VPN in TUN mode, the leak is invisible: the
+packets are inside the tunnel at the IP layer whatever any program does. On a
+machine whose only route out is the configured proxy, the credential went round it.
+
+Two things changed, and only one of them is code:
+
+- `dialUpstream` no longer takes the relay's `Wiring`. It takes a `Route`, which
+  is the five answers the dial actually needs, and `Wiring` is now built out of
+  one. `Route` and the dialler are exported from `src/relay`, so reaching the
+  server by the machine's own way is something another module can do rather than
+  something it has to reimplement. The refresher calls it with `carryingASeat`
+  true and gets the refusal, the reporting and the clock for nothing.
+- `refreshStaleSeats` requires its route. Not optional, not defaulted to direct.
+  A default would have been the bug all over again: nobody chose to send those
+  tokens past the proxy, nobody was asked.
+
+The lesson is the one about where a rule lives. A rule enforced inside a module is
+not enforced on the module next door, and "everything goes through one function"
+is a claim about a program that only a program-wide check can make. The negative
+control for the second caller is in
+`test/refresh-through-the-machines-route.test.ts`, in the same shape as the
+relay's: the direct route points at a dead port, so a refresh that succeeds can
+only have gone through the proxy.
+
+Three callers of the same shape are still open, in
+[known-gaps.md](../known-gaps.md): the Send token Probe, the profile identity read
+and the Stats login reads. They run in sittings rather than in the service, which
+is why they were not fixed in the same change and not why they are acceptable.

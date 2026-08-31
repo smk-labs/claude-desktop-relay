@@ -18,7 +18,7 @@ import { startOpener } from "./internal/open.ts";
 import { tunnelBlind } from "./internal/tunnel.ts";
 
 export type { RelayConfig, RelayNotice, RequestShape, Charge, Decision, Egress } from "./internal/config.ts";
-export { NOTHING_DECIDED, AT_MOST_ATTEMPTS } from "./internal/config.ts";
+export { NOTHING_DECIDED, AT_MOST_ATTEMPTS, AT_MOST_EXCHANGES, A_TURN_MAY_BE_HELD } from "./internal/config.ts";
 export type { Exchange, RequestFacts } from "./internal/exchange.ts";
 export type { TokenCounts } from "../tokens/index.ts";
 export { isRefusal, NOTHING_READ } from "./internal/exchange.ts";
@@ -31,6 +31,22 @@ export { isRefusal, NOTHING_READ } from "./internal/exchange.ts";
  * into this module's internals or keep a second, drifting copy of the header names.
  */
 export { factsFrom } from "./internal/exchange.ts";
+/**
+ * How traffic leaves this machine, and the one function allowed to act on it.
+ *
+ * On the interface because the relay is not the only thing in this program that
+ * sends a Seat's credential to Anthropic. The background usage refresher does
+ * too, and until 2026-08-30 it dialled the host itself: no proxy, no agent, no
+ * question asked, straight past whatever route the machine had named. ADR 0011
+ * says a Seat's credential never leaves except the way the machine would, and a
+ * rule that lives inside one module is a rule the module next door does not have.
+ *
+ * So the dialler is exported rather than copied. Anything carrying a Seat's
+ * credential calls this with `carryingASeat` true, and gets the refusal for free
+ * rather than having to remember it.
+ */
+export type { Route, RouteAsked } from "./internal/dial.ts";
+export { dialUpstream, routeFrom } from "./internal/dial.ts";
 /**
  * Part of the interface, not a convenience: anything that speaks CONNECT to the
  * relay has to read the relay's answer off a raw socket without destroying it,
@@ -55,6 +71,15 @@ export type { Head } from "./internal/head.ts";
  */
 export type { Pool } from "./internal/pool.ts";
 export { IDLE_FOR_AT_MOST_MS } from "./internal/pool.ts";
+
+/**
+ * How often the bound itself is looked at.
+ *
+ * Two seconds: long enough that an ordinary burst filling the gate for a moment
+ * says nothing, short enough that a wedge is named while somebody is still
+ * watching the screen it happened on.
+ */
+const HOW_OFTEN_THE_BOUND_IS_WATCHED = 2_000;
 
 export type RunningRelay = {
   readonly address: { readonly host: string; readonly port: number };
@@ -100,6 +125,35 @@ export async function startRelay(config: RelayConfig): Promise<RunningRelay> {
   const wiring = wiringFrom(config, { host: address, port });
   const opener = startOpener(wiring);
 
+  /**
+   * The one thing that watches the bound instead of the traffic.
+   *
+   * A gate at its limit with a queue behind it is not an error, so no error path
+   * reports it, and that is precisely why it went unseen: the relay's figures for
+   * how many are in the air and how many are waiting appear only inside failure
+   * messages, and a full gate produces no failures. Six days of logs held 3,414
+   * requests that died waiting and not one line saying the queue was the reason.
+   *
+   * Said only on the way in and out of the state, not every tick, because a relay
+   * that is busy for a minute is working and a log that repeats itself is a log
+   * nobody reads.
+   */
+  let wasFull = false;
+  const watch = setInterval(() => {
+    const full = wiring.gate.inFlight() >= wiring.gate.limit() && wiring.gate.waiting() > 0;
+    if (full === wasFull) return;
+    wasFull = full;
+    wiring.report({
+      kind: "gate-is-full",
+      summary: full
+        ? `Every one of the ${wiring.gate.limit()} turns is taken and ${wiring.gate.waiting()} are waiting. ` +
+          `Nothing new is being sent until one comes back.`
+        : `A turn came back. ${wiring.gate.inFlight()} of ${wiring.gate.limit()} in the air, ${wiring.gate.waiting()} waiting.`,
+    });
+  }, HOW_OFTEN_THE_BOUND_IS_WATCHED);
+  // Never the reason a process stays up: this watches work, it is not work.
+  watch.unref();
+
   server.on("connect", (request, client: Socket, head: Buffer) => {
     const { host, port } = splitTarget(request.url ?? "");
     if (head.length > 0) client.unshift(head);
@@ -120,6 +174,7 @@ export async function startRelay(config: RelayConfig): Promise<RunningRelay> {
       // Tunnels are long-lived by nature, so closing has to hang up on them.
       // `server.close` on its own waits for every connection to end, which for a
       // proxy means waiting forever.
+      clearInterval(watch);
       for (const socket of tunnels) socket.destroy();
       tunnels.clear();
       server.closeAllConnections();

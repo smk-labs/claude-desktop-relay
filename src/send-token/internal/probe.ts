@@ -1,8 +1,19 @@
-import { request } from "node:https";
-import type { IncomingMessage } from "node:http";
+import { request as httpRequest, type IncomingMessage } from "node:http";
+import { connect as connectTls } from "node:tls";
 
 import { judge, type Verdict } from "../../verify/index.ts";
+import { dialUpstream, routeFrom, type RouteAsked } from "../../relay/index.ts";
+import { machineEgress } from "../../window/index.ts";
 import type { Seat } from "../../seats/index.ts";
+
+/**
+ * How long the whole probe gets: the route, the handshake and the answer.
+ *
+ * The proxy has a clock of its own inside `dialUpstream`, and nothing else here
+ * did. A sitting that hangs on one Seat with a blank screen is worse than one
+ * that says the server never answered.
+ */
+const AT_MOST_MS = 20_000;
 
 /** Where a Probe goes in real use. */
 const ANTHROPIC = "https://api.anthropic.com";
@@ -61,18 +72,63 @@ export async function probeSendToken(options: {
   servername?: string;
   /** Extra authorities to trust. Only a test needs these. */
   trust?: readonly string[];
+  /** How traffic leaves. Unset, it is whatever this machine says. */
+  route?: RouteAsked;
 }): Promise<Verdict> {
   const where = new URL(options.origin ?? ANTHROPIC);
 
+  const host = where.hostname;
+  const port = where.port === "" ? 443 : Number(where.port);
+  const route = routeFrom(options.route ?? { egress: machineEgress });
+
+  /**
+   * Out the way this machine says, or not at all. ADR 0011.
+   *
+   * This used to be `node:https` with no agent named, which asks the machine
+   * nothing and goes straight out. On a machine whose only way out is a proxy,
+   * every probe then failed, and a failed probe is not a quiet failure: the
+   * sitting throws away the token it has just minted, because a token it could
+   * not prove is a token it will not keep. So a person authorized a mint, watched
+   * it succeed, and ended up with nothing, once per Seat.
+   */
   const answered = await new Promise<{ status: number; headers: IncomingMessage["headers"] }>((resolve) => {
-    const outgoing = request(
-      {
-        host: where.hostname,
-        port: where.port === "" ? 443 : Number(where.port),
+    let done = false;
+    let hangUp = () => {};
+    const finish = (answer: { status: number; headers: IncomingMessage["headers"] }) => {
+      if (done) return;
+      done = true;
+      clearTimeout(givingUp);
+      hangUp();
+      resolve(answer);
+    };
+    // A status of zero is what `judge` already reads as "the server never
+    // answered", so a failure needs no reason of its own invented here.
+    const gaveUp = () => finish({ status: 0, headers: {} });
+    const givingUp = setTimeout(gaveUp, AT_MOST_MS);
+
+    void (async () => {
+      let raw;
+      try {
+        raw = await dialUpstream(host, port, route, true);
+      } catch {
+        return gaveUp();
+      }
+      hangUp = () => raw.destroy();
+
+      const secure = connectTls({
+        socket: raw,
+        servername: options.servername ?? host,
+        ALPNProtocols: ["http/1.1"],
+        ...(options.trust === undefined ? {} : { ca: [...options.trust] }),
+      });
+      hangUp = () => secure.destroy();
+      secure.once("error", gaveUp);
+
+      const outgoing = httpRequest({
+        host,
+        port,
         path: MESSAGES,
         method: "POST",
-        ...(options.servername === undefined ? {} : { servername: options.servername }),
-        ...(options.trust === undefined ? {} : { ca: [...options.trust] }),
         headers: {
           "content-type": "application/json",
           "anthropic-version": API_VERSION,
@@ -80,19 +136,23 @@ export async function probeSendToken(options: {
           authorization: `Bearer ${options.token}`,
           "content-length": Buffer.byteLength(PROBE_BODY),
         },
-      },
-      (incoming) => {
+        /**
+         * No agent at all. Node honours `createConnection` only when there is no
+         * agent, and `agent: false` beside one makes Node dial the host itself,
+         * straight round the route above.
+         */
+        createConnection: () => secure,
+      });
+
+      outgoing.once("response", (incoming: IncomingMessage) => {
         // Drained, because a reply nobody reads holds the socket open and the
         // flow would sit there waiting on the next Seat.
         incoming.resume();
-        incoming.once("end", () => resolve({ status: incoming.statusCode ?? 0, headers: incoming.headers }));
-      },
-    );
-
-    // A status of zero is what `judge` already reads as "the server never
-    // answered", so a failure needs no reason of its own invented here.
-    outgoing.once("error", () => resolve({ status: 0, headers: {} }));
-    outgoing.end(PROBE_BODY);
+        incoming.once("end", () => finish({ status: incoming.statusCode ?? 0, headers: incoming.headers }));
+      });
+      outgoing.once("error", gaveUp);
+      outgoing.end(PROBE_BODY);
+    })();
   });
 
   const paidBy = answered.headers["anthropic-organization-id"];

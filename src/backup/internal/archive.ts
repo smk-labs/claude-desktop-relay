@@ -65,9 +65,23 @@ export async function latestBackup(folder: string = WHERE_BACKUPS_GO): Promise<{
 }
 
 /** What a backup holds, and when it was taken. */
+/** One Stats login in an archive: the profile it was read from, and the login. */
+export type BackedUpStatsLogin = { readonly profile: string; readonly statsLogin: string };
+
 export type Backup = {
   readonly savedAt: string;
   readonly seats: readonly BackedUpSeat[];
+  /**
+   * The Stats logins, and why they are optional.
+   *
+   * An archive written before this existed has no such field, and one written on
+   * a machine where every profile was signed out has none to write. Neither is a
+   * damaged archive, so the reader asks only for `seats` and treats this as empty
+   * when it is not there. A Send token pays; a Stats login only reads. Losing the
+   * second half of an archive costs the plan names and the idle usage on the new
+   * machine, not the ability to pay.
+   */
+  readonly statsLogins?: readonly BackedUpStatsLogin[];
 };
 
 /** The name of the archive inside, and of the file inside that. */
@@ -140,6 +154,7 @@ export async function writeBackup(options: {
   file: string;
   passphrase: string;
   holding: readonly BackedUpSeat[];
+  statsLogins?: readonly BackedUpStatsLogin[];
 }): Promise<void> {
   if (options.passphrase.length < 8) {
     throw new Error("that passphrase is too short to be worth having. Use at least eight characters.");
@@ -150,7 +165,13 @@ export async function writeBackup(options: {
 
   await mkdir(dirname(options.file), { recursive: true, mode: 0o700 });
 
-  const backup: Backup = { savedAt: new Date().toISOString(), seats: options.holding };
+  const backup: Backup = {
+    savedAt: new Date().toISOString(),
+    seats: options.holding,
+    // Left out entirely when there are none, so an archive taken on a machine with
+    // no readable profile is the same shape as one taken before this existed.
+    ...(options.statsLogins && options.statsLogins.length > 0 ? { statsLogins: options.statsLogins } : {}),
+  };
   const inside = Buffer.from(JSON.stringify(backup, null, 2) + "\n", "utf8");
   const locked = lockArchive(zipOneFile(INSIDE, inside), options.passphrase);
 

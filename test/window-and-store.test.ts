@@ -220,7 +220,14 @@ test("the variables reach the process that is started", async () => {
     // is the only thing worth asserting about the launch itself. Written in Node
     // rather than in a shell, because the shell is the one part of this that is
     // not the same on both machines and is not what is being tested.
-    const reporter = join(folder, "reporter.js");
+    // `.cjs` rather than `.js`, and that is the whole reason this is spelled out.
+    // A `.js` file is CommonJS or an ES module depending on the nearest
+    // `package.json` above it, and the folder is under the machine's temporary
+    // directory, which is somewhere anybody's leftover `package.json` can sit. One
+    // saying `"type": "module"` two levels up made this stand-in refuse to run and
+    // the test read as a launch that never happened. The extension says what the
+    // file is and nothing above it can argue.
+    const reporter = join(folder, "reporter.cjs");
     await writeFile(
       reporter,
       `const { writeFileSync } = require("node:fs");\n` +

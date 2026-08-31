@@ -45,6 +45,40 @@ Refusing is the safe answer and never the wrong one, since the alternative would
 be going round the proxy, but it is a smaller product on that machine and the code
 that would carry it is already there.
 
+## Three more credentials still leave without asking the machine
+
+Found 2026-08-30, while chasing something else. The background usage refresher
+sent a Seat's Send token straight out of the machine: `node:https`, no agent, no
+proxy, four at a time, never once asking how traffic leaves. That one is fixed and
+[has a test](../test/refresh-through-the-machines-route.test.ts). Three callers in
+the same shape are not, and they are listed here rather than quietly left:
+
+- ~~`src/send-token/internal/probe.ts`~~ **fixed 2026-08-30**, and it was not only
+  a leak. On a machine whose way out is a proxy, every probe failed, and a probe
+  that fails makes the sitting throw away the token it has just minted, because a
+  token it could not prove is a token it will not keep. Somebody authorized a
+  mint, watched it succeed and ended up with nothing, once per Seat, with no
+  message naming the cause. It dials through `dialUpstream` now and has a ceiling
+  of its own.
+- `src/profiles/internal/identity.ts` sends a Window account's own bearer token to
+  the profile endpoint with `fetch`.
+- `src/stats-login/internal/bootstrap.ts` and `usage.ts` send a Stats login cookie
+  to claude.ai with `fetch`.
+
+All three run in a sitting or a command somebody typed, never in the service, so
+none of them is the unattended background traffic the refresher was. That is why
+they are a gap and not the same emergency, and it is not a defence: on a machine
+whose only route out is the configured proxy, each is a credential going round it.
+`dialUpstream` is exported from `src/relay` now and takes a `Route`, so the fix is
+the same three-line one in each place. `fetch` is the awkward half: it has no seam
+for a socket, so those two want an `undici` dispatcher or a rewrite onto
+`node:http`, and neither is a change to make in a release week.
+
+The refresher is also outside the relay's own pool and gate, on purpose. Its
+probes each cost a fresh handshake and a round of four sits beside whatever the
+relay has in the air rather than inside its bound of twelve. At two requests an
+hour per Seat that is not worth a shared pool; at a hundred Seats it would be.
+
 ## Three things are implemented twice
 
 None of these is a bug today. All three are the arrangement that produces one,

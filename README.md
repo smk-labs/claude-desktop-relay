@@ -49,7 +49,7 @@ found and this release left alone, is written down in
 | starts itself with the machine | yes | yes | yes |
 | the page | yes | yes | no |
 | adds accounts without copying and pasting | yes | yes | no |
-| reads idle accounts' usage from your own logins | yes | yes | no |
+| reads idle accounts' usage from your own logins | yes | yes | carried in, not read |
 | carries a machine that names only a SOCKS proxy | yes | no | no |
 
 The relay itself, and everything that decides with it, is one body of code on all

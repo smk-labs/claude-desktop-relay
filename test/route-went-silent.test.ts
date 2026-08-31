@@ -164,3 +164,81 @@ test("the relay still serves the next request after a route has gone silent unde
     await upstream.close();
   }
 });
+
+/**
+ * The backstop behind every other guard in this file, and the one that was missing.
+ *
+ * On 2026-08-30 the relay served nothing for twenty-three minutes with an empty
+ * log and a healthy page. Every guard above covers a stall somebody had already
+ * met: the proxy not answering, the route going quiet, the caller hanging up.
+ * What took the relay down was none of them. A turn was taken, and inside it a
+ * `scutil --proxy` with no clock of its own was held by a VPN rewriting its
+ * routes. Twelve of those and there were no turns left, and because nothing
+ * between taking a turn and the close handler writes a line, the relay could not
+ * say so.
+ *
+ * So this asserts the property rather than the cause: whatever an exchange is
+ * doing, its turn comes back. The silence guard is set far out of reach here on
+ * purpose, so a pass cannot be the old guard doing the new one's work.
+ */
+test("a turn comes back from an exchange that would otherwise hold it for ever", async () => {
+  const upstream = await startSilentUpstream(OPEN_HOST);
+  const authority = await authorityFor(OPEN_HOST);
+  const notices: RelayNotice[] = [];
+
+  const CEILING_MS = 500;
+
+  const relay = await startRelay({
+    openHost: OPEN_HOST,
+    certificate: authority.leaf,
+    trust: [upstream.authority],
+    dial: () => ({ host: "127.0.0.1", port: upstream.port }),
+    // One turn, so the second request can only be served if the first gives its
+    // turn back. This is the gate's whole failure mode at its smallest.
+    atMostInFlight: 1,
+    // A hundred times the ceiling. If this test passes because of the silence
+    // guard, it is not testing what it says.
+    silentFor: 50_000,
+    aTurnMayBeHeld: CEILING_MS,
+    atMostAttempts: 1,
+    chargeFor: () => paying({ token: "sk-ant-oat01-seat-a", seat: "seat-a", organizationId: "org-seat-a" }),
+    onNotice: (notice) => notices.push(notice),
+  });
+
+  const ask = () =>
+    requestThrough({
+      relay: relay.address,
+      host: OPEN_HOST,
+      port: 443,
+      trust: upstream.authority,
+      path: "/v1/messages",
+      body: BODY,
+    }).then(
+      () => "answered",
+      () => "gave up",
+    );
+
+  try {
+    const began = Date.now();
+    // The second is started a beat later so it is genuinely queued behind the
+    // first rather than racing it for the one turn.
+    const first = ask();
+    await new Promise((wake) => setTimeout(wake, 50));
+    const second = ask();
+    await Promise.all([first, second]);
+    const took = Date.now() - began;
+
+    /**
+     * Two ceilings and change. Without the ceiling the second request never gets a
+     * turn at all and this test times out rather than failing, which is itself the
+     * shape of the bug: a wedge does not announce itself.
+     */
+    assert.ok(took < CEILING_MS * 6, `both must be let go of, took ${took}ms`);
+
+    const held = notices.filter((one) => /still held after/.test(one.summary));
+    assert.ok(held.length > 0, "the relay has to say a turn was taken back, or a wedge is silent again");
+  } finally {
+    await relay.close();
+    await upstream.close();
+  }
+});

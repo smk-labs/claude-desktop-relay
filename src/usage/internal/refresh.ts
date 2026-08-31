@@ -25,15 +25,16 @@
  * model with a message that reads exactly like an exhausted allowance, and a
  * refresher that did that would report healthy Seats as spent.
  */
-import { request } from "node:https";
+import { request as httpRequest } from "node:http";
+import { connect as connectTls } from "node:tls";
 import type { IncomingMessage } from "node:http";
 
-import { factsFrom } from "../../relay/index.ts";
+import { dialUpstream, factsFrom, routeFrom, type Route, type RouteAsked } from "../../relay/index.ts";
 import type { SeatStore } from "../../seats/index.ts";
 import type { SeatUsage } from "./known.ts";
 import type { UsageMemory } from "./memory.ts";
 
-const ANTHROPIC = { host: "api.anthropic.com", path: "/v1/messages" };
+const ANTHROPIC = { host: "api.anthropic.com", port: 443, path: "/v1/messages" };
 /** The cheapest thing the server will answer, shaped like Code's own request. */
 const MODEL = "claude-haiku-4-5-20251001";
 const BODY = JSON.stringify({
@@ -59,6 +60,16 @@ export const STALE_AFTER_SECONDS = Math.max(
   0,
   Number(process.env["RELAY_STALE_MINUTES"] ?? 25) * 60,
 );
+
+/**
+ * How a round is told to reach the server.
+ *
+ * A `RouteAsked` and one extra. `trust` is only ever set by a test, and it is the
+ * same seam `RelayConfig.trust` is: without it there is no way to stand a fake
+ * where Anthropic is, and the route claim below could only be argued rather than
+ * proved.
+ */
+export type RefreshRoute = RouteAsked & { readonly trust?: readonly string[] };
 
 export type Refreshed = {
   readonly asked: number;
@@ -93,40 +104,133 @@ export function whichAreStale(options: {
     .map((seat) => seat.name);
 }
 
-function ask(token: string): Promise<{ status: number; headers: IncomingMessage["headers"] }> {
-  return new Promise((resolve) => {
-    const outgoing = request(
-      {
-        host: ANTHROPIC.host,
-        path: ANTHROPIC.path,
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          "anthropic-version": "2023-06-01",
-          "anthropic-beta": "oauth-2025-04-20",
-          authorization: `Bearer ${token}`,
-          "content-length": Buffer.byteLength(BODY),
-        },
-      },
-      (incoming) => {
-        // Drained, because a reply nobody reads holds its socket open and the
-        // round would wait on it.
-        incoming.resume();
-        incoming.once("end", () => resolve({ status: incoming.statusCode ?? 0, headers: incoming.headers }));
-      },
-    );
+/**
+ * What one probe came back with, and the three ways it can end.
+ *
+ * `not-sent` is its own answer rather than another kind of failure. "The machine
+ * names a way out we could not use, so nothing was sent" and "it went out and the
+ * server said nothing" are different facts about different things, and a round
+ * that reports them as one number sends whoever reads it to the wrong place.
+ */
+type Answer =
+  | { readonly kind: "answered"; readonly status: number; readonly headers: IncomingMessage["headers"] }
+  | { readonly kind: "not-sent"; readonly why: string }
+  | { readonly kind: "no-answer"; readonly why: string };
 
+const describeError = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/**
+ * One probe, out by whatever way this machine says traffic leaves.
+ *
+ * Every byte here goes through `dialUpstream`, with `carryingASeat` true, which
+ * is the whole of the fix this function exists in. It used to call `request` from
+ * `node:https` with no agent and no proxy, so a Seat's Send token went straight
+ * out of the machine whatever the machine's proxy settings said. On a laptop
+ * running a VPN in tunnel mode that is invisible, because the traffic is inside
+ * the tunnel at the IP layer regardless; on a machine whose only route out is the
+ * configured proxy, the credential went round it. Found 2026-08-30, and the same
+ * thing ADR 0011 and `carryingASeat` were written to stop.
+ *
+ * TLS is terminated here rather than by `node:https` because the socket that
+ * comes back may already have travelled through a CONNECT tunnel or a SOCKS
+ * handshake, and wrapping it is the only way to keep exactly one handshake.
+ */
+function ask(options: { token: string; route: Route; trust: readonly string[] | null }): Promise<Answer> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let reached = false;
+    let hangUp: (() => void) | null = null;
+
+    const finish = (answer: Answer) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(givingUp);
+      // Hung up on however it ended, including well. Without an agent there is no
+      // connection to keep, so by the time an answer is in, the socket's only
+      // remaining job is to hold the process open.
+      hangUp?.();
+      resolve(answer);
+    };
+
+    /**
+     * The ceiling now covers the dial as well as the reply.
+     *
+     * It used to start at the request and so timed only the half that was already
+     * bounded. Reaching the machine's proxy, opening its tunnel and finishing a
+     * handshake all happen before a single header is written, and none of that had
+     * a clock of its own beyond the proxy's own eight seconds.
+     */
     const givingUp = setTimeout(() => {
-      outgoing.destroy();
-      resolve({ status: 0, headers: {} });
+      finish(
+        reached
+          ? { kind: "no-answer", why: `nothing arrived within ${AT_MOST_MS}ms` }
+          : { kind: "not-sent", why: `the route did not open within ${AT_MOST_MS}ms` },
+      );
     }, AT_MOST_MS);
-    const done = () => clearTimeout(givingUp);
-    outgoing.once("response", done);
-    outgoing.once("error", () => {
-      done();
-      resolve({ status: 0, headers: {} });
-    });
-    outgoing.end(BODY);
+
+    void (async () => {
+      let raw;
+      try {
+        raw = await dialUpstream(ANTHROPIC.host, ANTHROPIC.port, options.route, true);
+      } catch (error) {
+        // The route refused, or was not there. Nothing left this machine, which
+        // is the point: `dialUpstream` has already reported it the way the relay
+        // reports it, through this route's own `report`.
+        return finish({ kind: "not-sent", why: describeError(error) });
+      }
+      reached = true;
+      hangUp = () => raw.destroy();
+
+      try {
+        const secure = connectTls({
+          socket: raw,
+          servername: ANTHROPIC.host,
+          ALPNProtocols: ["http/1.1"],
+          ...(options.trust === null ? {} : { ca: [...options.trust] }),
+        });
+        secure.setNoDelay(true);
+        hangUp = () => secure.destroy();
+        secure.once("error", (error) => finish({ kind: "no-answer", why: describeError(error) }));
+
+        const outgoing = httpRequest({
+          host: ANTHROPIC.host,
+          port: ANTHROPIC.port,
+          path: ANTHROPIC.path,
+          method: "POST",
+          headers: {
+            "content-type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "anthropic-beta": "oauth-2025-04-20",
+            authorization: `Bearer ${options.token}`,
+            "content-length": Buffer.byteLength(BODY),
+          },
+          /**
+           * No agent at all, and the two words are load-bearing.
+           *
+           * Node honours `createConnection` only when there is no agent; setting
+           * `agent: false` beside one makes Node build an agent and dial the host
+           * itself, straight round everything above. That was measured in the
+           * relay on 2026-08-22, where it reached the real Cloudflare from a test.
+           * The negative control in `test/refresh-through-the-machines-route.test.ts`
+           * is what keeps saying it does not happen here.
+           */
+          createConnection: () => secure,
+        });
+
+        outgoing.once("response", (incoming: IncomingMessage) => {
+          // Drained, because a reply nobody reads holds its socket open and the
+          // round would wait on it.
+          incoming.resume();
+          incoming.once("end", () =>
+            finish({ kind: "answered", status: incoming.statusCode ?? 0, headers: incoming.headers }),
+          );
+        });
+        outgoing.once("error", (error) => finish({ kind: "no-answer", why: describeError(error) }));
+        outgoing.end(BODY);
+      } catch (error) {
+        finish({ kind: "no-answer", why: describeError(error) });
+      }
+    })();
   });
 }
 
@@ -141,9 +245,20 @@ export async function refreshStaleSeats(options: {
   readonly usage: UsageMemory;
   readonly at: number;
   readonly olderThan?: number;
+  /**
+   * How traffic leaves this machine, and it has no default on purpose.
+   *
+   * Required, so that a caller cannot get "straight out" by saying nothing. That
+   * is exactly how this function spent its life sending Send tokens past the
+   * machine's proxy: not by anybody deciding to, but by nobody being asked. Every
+   * caller already knows the answer; the relay in the same process is using it.
+   */
+  readonly route: RefreshRoute;
   /** Told what happened, one line per Seat, for a log or a terminal. */
   readonly say?: (line: string) => void;
 }): Promise<Refreshed> {
+  const route = routeFrom(options.route);
+  const trust = options.route.trust ?? null;
   const listed = await options.seats.list();
   const known = await options.usage.known(options.at);
   const stale = whichAreStale({
@@ -169,10 +284,17 @@ export async function refreshStaleSeats(options: {
         continue;
       }
 
-      const answered = await ask(token);
-      if (answered.status === 0) {
+      const answered = await ask({ token, route, trust });
+      if (answered.kind !== "answered") {
         summary.failed += 1;
-        options.say?.(`could not reach the server for ${name}`);
+        options.say?.(
+          answered.kind === "not-sent"
+            ? // Said as a refusal rather than as a failure, because that is what it
+              // is. Nothing was sent, and the Seat is not the thing that is wrong.
+              `${name} was not asked, because a Seat's credential does not go round ` +
+              `the route this machine names: ${answered.why}`
+            : `could not reach the server for ${name}: ${answered.why}`,
+        );
         continue;
       }
 

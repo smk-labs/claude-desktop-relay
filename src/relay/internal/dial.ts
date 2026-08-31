@@ -3,7 +3,7 @@ import { once } from "node:events";
 
 import { readHead } from "./head.ts";
 import { socksConnect } from "../../socks/index.ts";
-import type { Wiring } from "./config.ts";
+import type { Dial, Egress, RelayNotice } from "./config.ts";
 
 /**
  * Error codes that mean the machine's proxy is not there at all, as opposed to
@@ -27,13 +27,65 @@ const ABSENT = new Set(["ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "EADDRNOT
  */
 export const THE_PROXY_HAS_THIS_LONG = 8_000;
 
+/**
+ * Everything the one dialler needs, and deliberately nothing else.
+ *
+ * The relay's wiring is built out of this rather than beside it, so the relay and
+ * anything else that has to reach the server answer the same five questions from
+ * one definition. That matters because the second caller arrived late: the usage
+ * refresher spent its whole life dialling `api.anthropic.com` itself, with a
+ * Seat's Send token in the header and no idea the machine had named a way out
+ * (found 2026-08-30). It was masked by a VPN in tunnel mode, where the traffic is
+ * inside the tunnel at the IP layer whatever a program does, and on a machine
+ * whose only route out is a proxy it was a credential going straight past it.
+ *
+ * A route is not a convenience here. It is the shape of the question ADR 0011
+ * says must be asked before a Seat's credential travels, and a type nobody can
+ * satisfy by accident is what stops the next caller forgetting to ask it.
+ */
+export type Route = {
+  /** Asked per dial, so a proxy that appears or disappears is noticed. */
+  readonly egressNow: () => Promise<Egress>;
+  readonly whenTheProxyIsGone: "refuse" | "go-direct";
+  /** Where a direct dial lands. Identity in real use; a dead port in a test. */
+  readonly dial: Dial;
+  readonly report: (notice: RelayNotice) => void;
+  readonly proxyHasThisLong: number;
+};
+
+/**
+ * A route as a caller states it: one required answer and four defaults.
+ *
+ * How traffic leaves has no default and never will. Every other field has a right
+ * answer that is the same everywhere, but "the machine names nothing" is a claim
+ * about a machine, and a caller that has not asked must not be able to imply it.
+ */
+export type RouteAsked = {
+  readonly egress: () => Promise<Egress>;
+  readonly dial?: Dial;
+  readonly whenTheProxyIsGone?: "refuse" | "go-direct";
+  readonly report?: (notice: RelayNotice) => void;
+  readonly proxyHasThisLong?: number;
+};
+
+/** Fill in the four defaults. The one place they are written down. */
+export function routeFrom(asked: RouteAsked): Route {
+  return {
+    egressNow: asked.egress,
+    whenTheProxyIsGone: asked.whenTheProxyIsGone ?? "refuse",
+    dial: asked.dial ?? ((host, port) => ({ host, port })),
+    report: asked.report ?? (() => {}),
+    proxyHasThisLong: asked.proxyHasThisLong ?? THE_PROXY_HAS_THIS_LONG,
+  };
+}
+
 /** Whatever settles first: the work, or the clock. */
-async function before<T>(ms: number, what: Promise<T>, giveUp: () => void): Promise<T> {
+async function before<T>(ms: number, what: Promise<T>, giveUp: () => void, who = "the machine's proxy"): Promise<T> {
   let timer: NodeJS.Timeout;
   const clock = new Promise<never>((_, reject) => {
     timer = setTimeout(() => {
       giveUp();
-      const late = new Error(`the machine's proxy did not answer within ${ms}ms`);
+      const late = new Error(`${who} did not answer within ${ms}ms`);
       (late as NodeJS.ErrnoException).code = "ETIMEDOUT";
       reject(late);
     }, ms);
@@ -49,11 +101,14 @@ function codeOf(error: unknown): string {
   return typeof error === "object" && error !== null && "code" in error ? String(error.code) : "";
 }
 
-async function dialDirect(host: string, port: number, wiring: Wiring): Promise<Socket> {
-  const where = wiring.dial(host, port);
+async function dialDirect(host: string, port: number, route: Route): Promise<Socket> {
+  const where = route.dial(host, port);
   const socket = connect(where.port, where.host);
   socket.setNoDelay(true);
-  await once(socket, "connect");
+  // The same clock the proxy path gets. A direct dial rejects on a refusal by
+  // itself, but a blackholed route answers nothing at all, and the operating
+  // system's own patience for that is over a minute of a turn nobody can use.
+  await before(route.proxyHasThisLong, once(socket, "connect"), () => socket.destroy(), `${where.host}:${where.port}`);
   return socket;
 }
 
@@ -107,7 +162,7 @@ async function dialThroughProxy(
 export async function dialUpstream(
   host: string,
   port: number,
-  wiring: Wiring,
+  route: Route,
   /**
    * Whether a Seat's own credential is about to travel down this socket.
    *
@@ -125,17 +180,17 @@ export async function dialUpstream(
    */
   carryingASeat: boolean,
 ): Promise<Socket> {
-  const egress = await wiring.egressNow();
+  const egress = await route.egressNow();
 
   if (egress.kind === "refuse" && !carryingASeat) {
-    wiring.report({
+    route.report({
       kind: "machine-proxy-unreachable",
       summary:
         `This machine names a way out the relay cannot use (${egress.why}). No Seat is paying for ` +
         `${host}:${port}, so it went straight out, which is what this machine would have done ` +
         `without the relay installed.`,
     });
-    return dialDirect(host, port, wiring);
+    return dialDirect(host, port, route);
   }
 
   if (egress.kind === "refuse") {
@@ -147,7 +202,7 @@ export async function dialUpstream(
     );
   }
 
-  if (egress.kind === "direct") return dialDirect(host, port, wiring);
+  if (egress.kind === "direct") return dialDirect(host, port, route);
 
   /**
    * SOCKS, which is a route like any other and never a reason to go direct.
@@ -159,7 +214,7 @@ export async function dialUpstream(
    * `whenTheProxyIsGone: "go-direct"` in reach of a case nobody has measured.
    *
    * The proxy's own address is dialled straight, exactly as the HTTP proxy's is,
-   * and not through `wiring.dial`. That seam redirects where a *direct* dial to the
+   * and not through `route.dial`. That seam redirects where a *direct* dial to the
    * opened host lands, which is what makes it the negative control: point it at a
    * dead port and a request that still succeeds can only have gone through here.
    */
@@ -168,17 +223,20 @@ export async function dialUpstream(
       through: egress.at,
       to: { host, port },
       credentials: egress.credentials,
+      // One patience for every way out, so a machine's route cannot be the thing
+      // that decides how long a stall lasts.
+      patience: route.proxyHasThisLong,
     });
   }
 
   const proxy = egress.at;
   try {
-    return await dialThroughProxy(host, port, proxy, wiring.proxyHasThisLong);
+    return await dialThroughProxy(host, port, proxy, route.proxyHasThisLong);
   } catch (error) {
     if (!ABSENT.has(codeOf(error))) throw error;
 
-    if (wiring.whenTheProxyIsGone === "refuse" && carryingASeat) {
-      wiring.report({
+    if (route.whenTheProxyIsGone === "refuse" && carryingASeat) {
+      route.report({
         kind: "machine-proxy-unreachable",
         summary:
           `The machine's own proxy at ${proxy.host}:${proxy.port} is not listening (${codeOf(error)}), ` +
@@ -193,7 +251,7 @@ export async function dialUpstream(
       );
     }
 
-    wiring.report({
+    route.report({
       kind: "machine-proxy-unreachable",
       summary:
         `The machine's own proxy at ${proxy.host}:${proxy.port} is not listening (${codeOf(error)}), ` +
@@ -201,6 +259,6 @@ export async function dialUpstream(
         `Check the machine's proxy settings, or a VPN that took the port with it.`,
     });
 
-    return dialDirect(host, port, wiring);
+    return dialDirect(host, port, route);
   }
 }

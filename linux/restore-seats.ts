@@ -15,6 +15,7 @@ import { WHERE_BACKUPS_GO, isABackupName } from "../src/backup/index.ts";
 import { openSeatStore } from "../src/seats/index.ts";
 import { askSecretly, stopAsking } from "../src/ask/index.ts";
 import { readBackup } from "../src/backup/index.ts";
+import { keepStatsLogins } from "../src/stats-login/index.ts";
 import { fileVault } from "./internal/file-vault.ts";
 import { linuxHome, vaultFile } from "./internal/where.ts";
 
@@ -69,8 +70,24 @@ try {
       say(`  put back ${seat.name}`);
     }
 
+    /**
+     * The Stats logins, after the Seats and never before them.
+     *
+     * A Seat pays and a Stats login only reads, so an interruption between the
+     * two leaves a machine that works and reports less, never one that reports
+     * well and cannot pay. There is no Claude Desktop profile to read here, so
+     * an archive is the only way these ever arrive on this machine.
+     */
+    let logins = 0;
+    if (backup.statsLogins !== undefined && backup.statsLogins.length > 0) {
+      logins = await keepStatsLogins(backup.statsLogins);
+      say(`  put back ${logins} Stats logins`);
+    }
+
     say();
     say(`${put} Seats are in ${vaultFile(home)}, readable only by you.`);
+    if (logins > 0) say(`${logins} Stats logins came with them, so plans and idle usage read as figures.`);
+    else say(`This archive carried no Stats logins, so plans and idle usage will read "not known".`);
     say(`See them with:  relay-linux seats`);
     code = 0;
   }

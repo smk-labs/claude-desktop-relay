@@ -311,6 +311,16 @@ The passphrase is read from the terminal, or from standard input when there is
 none, so it can cross an ssh connection without ever being an argument or an
 environment variable that `ps` would show to anyone else on the machine.
 
+**The archive carries the Stats logins too, and on this machine that is the only
+way they ever arrive.** There is no Claude Desktop profile here to read one out
+of. Without them a restored machine pays correctly and reads "not known" for every
+plan and every idle Seat, which is most of what a screen is for. They land in
+`~/.claude-desktop-relay-secrets/stats-logins.json`, mode 0600 in a 0700
+directory, for the same reason and at the same cost as the Send tokens above:
+there is nowhere on this machine to keep a key that a relay started from a boot
+job could still reach. Seats are put back before logins, so an interruption leaves
+a machine that pays and reports less, never one that reports well and cannot pay.
+
 ## Proving it, rather than believing it
 
 ```bash

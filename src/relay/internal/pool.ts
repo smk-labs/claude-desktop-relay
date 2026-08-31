@@ -128,16 +128,23 @@ export function openPool(options: { wiring: Wiring; idleForAtMostMs?: number }):
       super({
         keepAlive: true,
         /**
-         * The same number the gate allows in the air.
+         * As many as there may be exchanges, not as many as there may be dials.
          *
-         * Not the thing doing the bounding: the gate is, and a larger number here
-         * changes nothing any test can see. It is written as the gate's own limit
-         * so the two cannot drift into disagreeing, which is the state in which a
-         * reader has to work out which one wins.
+         * This used to be the gate's own limit, on the reasoning that the gate was
+         * the thing doing the bounding and a larger number here could change
+         * nothing. That stopped being true when the turn started coming back at
+         * the head of the reply (ADR 0017): an exchange that is streaming holds a
+         * socket and no turn, so a bound written as the gate's would have queued
+         * those inside Node's own agent, invisibly, which is the one place in this
+         * program where a queue has nothing watching it.
+         *
+         * Still per agent and so still per Seat, which is worth knowing rather
+         * than assuming: with several Seats paying at once the real ceiling is
+         * this times that. One pays at a time in ordinary use.
          */
-        maxSockets: options.wiring.gate.limit(),
+        maxSockets: options.wiring.exchanges.limit(),
         // As many as may be in the air: see the note at the top of this file.
-        maxFreeSockets: options.wiring.gate.limit(),
+        maxFreeSockets: options.wiring.exchanges.limit(),
       });
       this.port = port;
       this.carryingASeat = carryingASeat;

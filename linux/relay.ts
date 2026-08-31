@@ -216,7 +216,17 @@ try {
       const { refreshStaleSeats } = await import("../src/usage/index.ts");
       // Everything, when asked by hand: somebody typing this wants the numbers
       // now, not the ones that happen to be older than the round's threshold.
-      const summary = await refreshStaleSeats({ seats, usage, at, olderThan: 0, say: complain });
+      const summary = await refreshStaleSeats({
+        seats,
+        usage,
+        at,
+        olderThan: 0,
+        // Direct, which is what this machine does and what `linux/serve.ts` says
+        // in the same words. Stated rather than defaulted: a Send token is a
+        // Seat's credential, and how it leaves is never something to leave blank.
+        route: { egress: async () => ({ kind: "direct" }) },
+        say: complain,
+      });
       say(`${summary.answered} of ${summary.asked} Seats answered.`);
       if (summary.failed > 0) say(`${summary.failed} could not be reached.`);
       say(`See them with:  relay-linux seats`);

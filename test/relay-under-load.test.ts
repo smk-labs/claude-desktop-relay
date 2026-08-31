@@ -1,7 +1,8 @@
 import { strict as assert } from "node:assert";
 import { test, after } from "node:test";
+import { once } from "node:events";
 
-import { openGate, startRelay, type RelayNotice } from "../src/relay/index.ts";
+import { AT_MOST_EXCHANGES, openGate, startRelay, type RelayNotice } from "../src/relay/index.ts";
 import { startCrowdedUpstream, startEchoServer } from "./helpers/fake-upstream.ts";
 import { startImpatientMachineProxy } from "./helpers/fake-machine-proxy.ts";
 import { authorityFor, forgetAuthorities } from "./helpers/authorities.ts";
@@ -63,6 +64,11 @@ async function drive(options: { inFlight?: number; proxyPatienceMs: number }) {
     trust: [upstream.authority],
     machineProxy: { host: proxy.host, port: proxy.port },
     ...(options.inFlight === undefined ? {} : { atMostInFlight: options.inFlight }),
+    // Pinned to the dial bound, so these tests keep measuring the thing they were
+    // written for. Since ADR 0017 the turn comes back at the head of the reply and
+    // the looser bound is what caps open sockets, so leaving this at its default
+    // would let 48 tunnels stand while the assertions below still said 4.
+    ...(options.inFlight === undefined ? {} : { atMostExchanges: options.inFlight }),
     chargeFor: () => paying({ token: "sk-ant-oat01-seat-a", seat: "seat-a", organizationId: "org-seat-a" }),
     onNotice: (notice) => notices.push(notice),
   });
@@ -147,6 +153,13 @@ test("bounded, the same burst all succeeds and the proxy never hangs up on anyth
   assert.equal(failed, 0, "not one request may be lost to a queue the relay made for itself");
   assert.equal(ok, ASKED_AT_ONCE);
   assert.equal(hungUpOn, 0, "nothing sat quiet long enough for the proxy to lose patience");
+  /**
+   * The bound being asserted is the one on open tunnels, which since ADR 0017 is
+   * `atMostExchanges` rather than the gate. `drive` pins the two together for
+   * exactly this reason: with only the gate set, the turn now comes back at the
+   * head of the reply, tunnels would stand well past four, and this line would go
+   * on passing while measuring nothing.
+   */
   assert.ok(tunnelsAtOnce <= 4, `never more tunnels open than allowed, saw ${tunnelsAtOnce}`);
   // Connections are still one per request at this stage; reuse is the next step.
   // What matters here is that never more than the bound are open at any moment.
@@ -227,9 +240,22 @@ test("a burst of twenty costs a handful of connections, not twenty", async () =>
 
     assert.equal(upstream.answered(), HOW_MANY);
     const opened = upstream.totalConnections();
-    // Twelve may be in the air at once, so twelve is the floor for twenty arriving
-    // together. Anything near twenty means nothing is being reused.
-    assert.equal(opened <= 14, true, `${HOW_MANY} requests over ${opened} connections`);
+    /**
+     * The floor is however many may be open at once, which since ADR 0017 is the
+     * exchange bound and not the gate: the gate hands its turn back at the head of
+     * the reply, so it no longer decides how many sockets stand together.
+     *
+     * The claim is unchanged and it is about reuse: twenty requests must not cost
+     * twenty connections. The number it is measured against is now read from the
+     * relay's own bound rather than written out as twelve, so it cannot drift into
+     * asserting something nobody meant.
+     */
+    const mayStandTogether = Math.min(AT_MOST_EXCHANGES, HOW_MANY);
+    assert.ok(
+      opened <= mayStandTogether + 2,
+      `${HOW_MANY} requests over ${opened} connections, when at most ${mayStandTogether} may stand together`,
+    );
+    assert.ok(opened < HOW_MANY, `${opened} connections for ${HOW_MANY} requests is no reuse at all`);
   } finally {
     await relay.close();
     await upstream.close();
@@ -333,5 +359,85 @@ test("a proxy that accepts and then says nothing does not hang the tunnel for ev
     await relay.close();
     await silent.close();
     await echo.close();
+  }
+});
+
+/**
+ * What the split is for: a reply that takes its time no longer costs a turn.
+ *
+ * Holding the turn until the last byte made the relay's throughput the bound
+ * divided by how long a reply takes. On this traffic that was twelve over about
+ * thirty seconds, or roughly 1,400 requests an hour, and six days of the relay's
+ * own log show it sitting on exactly that ceiling: every busy hour inside a band
+ * of 31 to 38 seconds a turn, with 14.3% of all requests dying in the queue.
+ *
+ * The turn now comes back at the head of the reply, because everything the turn
+ * protects against has already happened by then. This is that claim as an
+ * experiment: with only two turns, eight replies that each dawdle must overlap
+ * rather than queue. Under the old shape they could not, and this test would take
+ * four holds instead of one.
+ */
+test("a reply that takes its time holds a socket, not a turn", async () => {
+  const { createServer: createTlsServer } = await import("node:tls");
+  const authority = await authorityFor(OPEN_HOST);
+
+  const HOLD_MS = 400;
+  const ASKED = 8;
+  const TURNS = 2;
+
+  // Head at once, body later. The head is the moment the turn should come back.
+  const upstream = createTlsServer({ key: authority.leaf.key, cert: authority.leaf.cert }, (socket) => {
+    socket.on("data", () => {
+      socket.write("HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\n");
+      setTimeout(() => socket.end("ok"), HOLD_MS);
+    });
+  });
+  upstream.listen(0, "127.0.0.1");
+  await once(upstream, "listening");
+  const upstreamPort = (upstream.address() as { port: number }).port;
+
+  const relay = await startRelay({
+    openHost: OPEN_HOST,
+    certificate: authority.leaf,
+    trust: [authority.caCertificate],
+    dial: () => ({ host: "127.0.0.1", port: upstreamPort }),
+    atMostInFlight: TURNS,
+    atMostExchanges: ASKED * 2,
+    chargeFor: () => paying({ token: "sk-ant-oat01-seat-a", seat: "seat-a", organizationId: "org-seat-a" }),
+  });
+
+  try {
+    const began = Date.now();
+    await Promise.all(
+      Array.from({ length: ASKED }, () =>
+        requestThrough({
+          relay: relay.address,
+          host: OPEN_HOST,
+          port: 443,
+          trust: authority.caCertificate,
+          path: "/v1/messages",
+          body: `{"model":"claude-opus-5","messages":[]}`,
+        }),
+      ),
+    );
+    const took = Date.now() - began;
+
+    /**
+     * Two holds, which is one for the work and one for headroom.
+     *
+     * Sized against both outcomes rather than against the good one alone: with
+     * the turn released at the head this measures about one hold, and with the
+     * turn held to the last byte it measures three or more. A bound at four holds
+     * is arithmetically correct and catches nothing, which was the first version
+     * of this line.
+     */
+    const TWO_HOLDS = HOLD_MS * 2;
+    assert.ok(
+      took < TWO_HOLDS,
+      `${ASKED} replies each held ${HOLD_MS}ms took ${took}ms; over ${TWO_HOLDS}ms means turns are being held past the head`,
+    );
+  } finally {
+    await relay.close();
+    await new Promise((done) => upstream.close(() => done(null)));
   }
 });

@@ -66,6 +66,55 @@ test("a backup gives back exactly the Seats and tokens that went into it", async
 });
 
 /**
+ * The half of an archive that decides whether a restored machine can say anything.
+ *
+ * A Send token pays and can say nothing about a plan. Every plan name, every
+ * Multiplier and every idle Seat's usage is read from a claude.ai session, and
+ * those sessions live in Claude Desktop profiles that do not travel. So an
+ * archive of tokens alone restores a machine that bills correctly and reads "not
+ * known" on every row, which is exactly the thing somebody carrying a backup to
+ * Windows or a server is trying to avoid.
+ */
+test("a backup carries the Stats logins as well, and gives them back unchanged", async () => {
+  await inATempFolder(async (folder) => {
+    const file = join(folder, "send-tokens.zip.enc");
+    const statsLogins = [
+      { profile: "ana", statsLogin: "sk-ant-sid01-anas-login" },
+      { profile: "bo", statsLogin: "sk-ant-sid01-bos-login" },
+    ];
+    await writeBackup({ file, passphrase: PASSPHRASE, holding: HOLDING, statsLogins });
+
+    const read = await readBackup({ file, passphrase: PASSPHRASE });
+    assert.deepEqual(read.statsLogins, statsLogins);
+    assert.deepEqual(read.seats, HOLDING, "carrying the logins must not disturb the Seats");
+
+    // They are inside the cipher like everything else. A Stats login can read an
+    // account's plan and its spending, so a copy beside the archive would be a
+    // credential in a plain file.
+    const raw = await readFile(file);
+    assert.equal(raw.includes(Buffer.from("anas-login")), false);
+  });
+});
+
+/**
+ * Older archives, and machines where every profile was signed out.
+ *
+ * Neither is damaged, so neither may be refused. The reader asks for the Seats and
+ * treats the logins as absent, because losing the second half costs the plan names
+ * and not the ability to pay.
+ */
+test("an archive with no Stats logins in it still opens, and says it has none", async () => {
+  await inATempFolder(async (folder) => {
+    const file = join(folder, "send-tokens.zip.enc");
+    await writeBackup({ file, passphrase: PASSPHRASE, holding: HOLDING });
+
+    const read = await readBackup({ file, passphrase: PASSPHRASE });
+    assert.equal(read.statsLogins, undefined);
+    assert.equal(read.seats.length, HOLDING.length);
+  });
+});
+
+/**
  * The whole point of locking it. This file holds credentials that each pay for a
  * year, so a reader who finds it must find nothing they can use.
  */

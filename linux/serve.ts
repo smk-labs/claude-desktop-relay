@@ -135,6 +135,10 @@ async function refreshRound(): Promise<void> {
     usage,
     at: now(),
     olderThan: STALE_AFTER_SECONDS,
+    // The same way out the relay above uses. Direct on this machine, which is a
+    // reading rather than an assumption, and it comes from the one place that
+    // holds it so the two cannot disagree. ADR 0011.
+    route: { egress: egressNow, report: (notice) => say(`${notice.kind}: ${notice.summary}`) },
     say,
   }).catch((error: unknown) => {
     say(`what the Seats have spent could not be brought up to date: ${describeError(error)}`);

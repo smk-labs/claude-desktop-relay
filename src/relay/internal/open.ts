@@ -37,6 +37,24 @@ export function startOpener(wiring: Wiring): Opener {
     });
   });
 
+  /**
+   * Node's own request clock, turned off, because this server is the slow party.
+   *
+   * `requestTimeout` bounds how long a client may take to deliver a whole
+   * request, and it defaults to five minutes. A relay that queues holds the
+   * request paused on purpose (see `forward`), so a body larger than the stream's
+   * high-water mark stays unfinished for exactly as long as the queue is long.
+   * Node then destroyed the request as if the client were slow, and because that
+   * arrives as `response.destroyed`, the relay could not tell it from a Code
+   * session cancelling and reported thousands of its own kills as the caller
+   * giving up. Worse, it destroys the whole keep-alive socket, so the other
+   * exchanges riding it die too.
+   *
+   * Two clocks where the hidden one wins is the thing being removed here. The
+   * bound below is ours, it is stated, and it is the only one.
+   */
+  server.requestTimeout = 0;
+
   return {
     take(client, port) {
       client.write(ESTABLISHED);
@@ -93,6 +111,16 @@ async function forward(
   const path = request.url ?? "";
   const method = request.method ?? "";
 
+  /**
+   * The outer bound, taken first and held to the last byte.
+   *
+   * This is the one that says how much the relay may be holding at once:
+   * descriptors, and bodies in memory. It is looser than the turn below it
+   * because it is answering a different question, and taking it first is what
+   * makes the two orderly rather than a deadlock waiting to happen.
+   */
+  const doneWithExchange = await wiring.exchanges.enter();
+
   // The turn is taken before anything is dialled, which is the whole point: the
   // connection that would collapse the route is never opened in the first place.
   const waited = wiring.gate.waiting();
@@ -104,13 +132,66 @@ async function forward(
    *
    * A turn that is never handed back starves everything behind it, and twelve of
    * those wedge the relay for good with nothing in any log to say why.
+   *
+   * What it covers is the part that can collapse the route: the dial, the
+   * request, and the wait for the head of the reply. That wait is the quiet one
+   * a proxy cannot tell from a dead tunnel, which is the whole of the 2026-08-22
+   * shape, so it is deliberately inside. Once the head is in, bytes are moving
+   * and the connection is visibly alive, so the turn goes back and the exchange
+   * finishes under the outer bound instead.
    */
+  let ceiling: NodeJS.Timeout;
   let handedBack = false;
   const handBack = () => {
     if (handedBack) return;
     handedBack = true;
     noLongerBusy();
   };
+
+  /**
+   * Everything given up at once, for the ways an exchange ends before it streams.
+   *
+   * The turn and the outer bound come back together on every failure path, and
+   * apart on exactly one: the good one, where the turn goes back at the head and
+   * this waits for the last byte.
+   */
+  let letGo = false;
+  const letEverythingGo = () => {
+    handBack();
+    if (letGo) return;
+    letGo = true;
+    clearTimeout(ceiling);
+    doneWithExchange();
+  };
+
+  /**
+   * The turn's own ceiling, and the only thing here that cannot be reasoned past.
+   *
+   * Every other guard in this file covers a named way an exchange can stall: the
+   * proxy not answering, the upstream going silent, the caller hanging up. This
+   * one covers the ways nobody has named yet, and on 2026-08-30 there was one: a
+   * `scutil --proxy` with no clock of its own, reached from inside this turn, held
+   * by a VPN rewriting its routes. Twelve of those took every turn the relay had,
+   * and because nothing between here and the close handler below writes a line,
+   * the relay served nothing for twenty-three minutes and said nothing at all.
+   *
+   * It is a backstop and not a reply-time limit, which is worth being plain
+   * about: it does end an honest exchange that runs past it. Ten minutes is above
+   * three attempts each waiting out the full silence guard, and forty times the
+   * measured p90 of a real exchange, so an honest one reaching it is a thing worth
+   * hearing about rather than a cost worth paying quietly.
+   */
+  ceiling = setTimeout(() => {
+    wiring.report({
+      kind: "open-failed",
+      summary:
+        `${method} ${path}: still held after ${Math.round(wiring.aTurnMayBeHeld / 1000)}s, ` +
+        `so its turn was taken back. Nothing here should reach this: see the ceiling in open.ts.`,
+    });
+    request.destroy();
+    response.destroy();
+    letEverythingGo();
+  }, wiring.aTurnMayBeHeld);
 
   /**
    * A caller that gave up while it was queued gets nothing dialled for it.
@@ -126,7 +207,7 @@ async function forward(
       kind: "caller-went-away",
       summary: `${method} ${path}: the caller gave up while it was queued for ${queuedFor}ms, so nothing was dialled for it.`,
     });
-    handBack();
+    letEverythingGo();
     return;
   }
 
@@ -151,7 +232,7 @@ async function forward(
       kind: "open-failed",
       summary: `${method} ${path}: deciding who pays failed, so nothing was sent: ${describeError(error)}`,
     });
-    handBack();
+    letEverythingGo();
     if (!response.headersSent) response.writeHead(502, { "content-type": "text/plain" });
     response.end();
     const nothing = factsFrom({
@@ -200,7 +281,7 @@ async function forward(
           `after ${Math.round(performance.now() - startedAt)}ms, ${wiring.gate.inFlight() - 1} other exchanges in the air.`,
       });
     }
-    handBack();
+    letEverythingGo();
     /**
      * Only when it ended badly, so the code says what it means.
      *
@@ -259,7 +340,7 @@ async function forward(
             `and this one queued for ${queuedFor}ms behind ${waited}.`,
         });
       }
-      handBack();
+      letEverythingGo();
       if (!response.headersSent) response.writeHead(502, { "content-type": "text/plain" });
       response.end();
       const nothing = factsFrom({
@@ -327,6 +408,25 @@ async function forward(
         continue;
       }
     }
+
+    /**
+     * The turn goes back here, one moment before the reply starts moving.
+     *
+     * This line is the whole of ticket 0017 and it is worth saying why it is
+     * safe. The turn exists to keep the machine's proxy from holding more quiet
+     * tunnels than it has patience for. Everything quiet has already happened:
+     * the dial, the request, and the wait for this head. What follows is bytes
+     * arriving, which is the opposite of the shape that collapsed the route.
+     *
+     * What it buys is the difference between a bound on dials and a bound on
+     * conversations. Holding the turn through the body meant twelve replies of
+     * about thirty seconds each, which is a ceiling of roughly 1,400 requests an
+     * hour: measured on six days of this relay's own log, where every busy hour
+     * sat inside a band of 31 to 38 seconds a turn and 14.3% of all requests died
+     * waiting for one. The exchange is still bounded, by `wiring.exchanges`, which
+     * is what keeps descriptors and held bodies finite.
+     */
+    handBack();
 
     // The counts are the last thing to arrive, so this is the only moment a whole
     // row about this exchange exists.

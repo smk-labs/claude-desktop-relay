@@ -30,7 +30,7 @@ import { readChoice, writeChoice, readStanding, pickPayer } from "../src/payer/i
 import { latestBackup } from "../src/backup/index.ts";
 import { openVerdictLog } from "../src/verify/index.ts";
 import { thisMachine } from "../src/control/index.ts";
-import type { Egress } from "../src/relay/index.ts";
+import type { Egress, RelayNotice } from "../src/relay/index.ts";
 
 const OPEN_HOST = "api.anthropic.com";
 const home = relayHome();
@@ -143,13 +143,44 @@ let readAt = 0;
  */
 function readItAgain(): void {
   known = null;
+  asking = null;
 }
 
+/**
+ * What is done with a notice, wherever it came from.
+ *
+ * Named rather than written inline, because two things in this process reach
+ * Anthropic now: the relay, and the round that keeps what each Seat has spent up
+ * to date. Both dial through the machine's own route, both learn the same thing
+ * when it is not there, so both say it the same way and both throw the cached
+ * reading away.
+ */
+function noticed(notice: RelayNotice): void {
+  // A proxy that would not answer is the one piece of news that makes our
+  // cached reading worthless, so it is thrown away rather than waited out.
+  if (notice.kind === "machine-proxy-unreachable") readItAgain();
+  say(`${notice.kind}: ${notice.summary}`);
+}
+
+/**
+ * The reading in progress, so a burst asks the machine once rather than each.
+ *
+ * The test and the assignment used to sit either side of an `await`, which is
+ * long enough for every request in a burst to find nothing cached and start its
+ * own `scutil`. Twelve turns arriving together spawned twelve processes, and each
+ * exchange asks twice, so the machine was answering the same question two dozen
+ * times over to no purpose. Holding the promise rather than the answer is what
+ * makes the second asker wait for the first instead of joining it.
+ */
+let asking: Promise<Egress> | null = null;
+
 async function egressNow(): Promise<Egress> {
-  if (known === null || Date.now() - readAt > 60_000) {
-    known = await machineEgress();
-    readAt = Date.now();
-  }
+  if (known !== null && Date.now() - readAt <= 60_000) return known;
+  asking ??= machineEgress().finally(() => {
+    asking = null;
+  });
+  known = await asking;
+  readAt = Date.now();
   return known;
 }
 
@@ -315,12 +346,7 @@ const relay = await startRelay({
       })
       .catch((error: unknown) => say(`a history row could not be kept: ${describeError(error)}`));
   },
-  onNotice: (notice) => {
-    // A proxy that would not answer is the one piece of news that makes our
-    // cached reading worthless, so it is thrown away rather than waited out.
-    if (notice.kind === "machine-proxy-unreachable") readItAgain();
-    say(`${notice.kind}: ${notice.summary}`);
-  },
+  onNotice: noticed,
 });
 
 /**
@@ -342,6 +368,11 @@ async function refreshRound(): Promise<void> {
     usage,
     at: now(),
     olderThan: STALE_AFTER_SECONDS,
+    // The same way out the relay uses, asked the same way. A Send token is a
+    // Seat's credential, so it never leaves except by the machine's own route,
+    // and a round that cannot take that route says so rather than going round
+    // it. ADR 0011.
+    route: { egress: egressNow, report: noticed },
     say,
   }).catch((error: unknown) => {
     say(`what the Seats have spent could not be brought up to date: ${describeError(error)}`);

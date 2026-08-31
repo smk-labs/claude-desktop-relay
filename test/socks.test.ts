@@ -8,6 +8,8 @@
  */
 import { strict as assert } from "node:assert";
 import { test, after } from "node:test";
+import { createServer, type Socket as NetSocket } from "node:net";
+import { once } from "node:events";
 
 import { startRelay, type RelayNotice } from "../src/relay/index.ts";
 import { socksConnect } from "../src/socks/index.ts";
@@ -265,5 +267,46 @@ test("a name too long for the protocol is refused before anything is sent", asyn
     assert.deepEqual(socks.asked, []);
   } finally {
     await socks.close();
+  }
+});
+
+/**
+ * The clock the HTTP proxy path has had since 2026-08-23, in the egress that
+ * never got it.
+ *
+ * A proxy that accepts the connection and then says nothing is not a proxy that
+ * refuses: nothing errors, nothing closes, and every step of the handshake waits
+ * on bytes that are not coming. On the HTTP path that hung every tunnel in the
+ * Window until a clock was put on it. This path had no clock at all, on the one
+ * kind of machine most likely to produce the fault, so it is asserted here as a
+ * property of the handshake itself rather than through the relay.
+ */
+test("a SOCKS proxy that accepts and then says nothing fails rather than hanging", async () => {
+  // Accepts, holds, and answers nothing. Deliberately not the shared helper: the
+  // point is a proxy that never speaks the protocol at all.
+  const held: NetSocket[] = [];
+  const mute = createServer((socket) => held.push(socket));
+  mute.listen(0, "127.0.0.1");
+  await once(mute, "listening");
+  const port = (mute.address() as { port: number }).port;
+
+  const PATIENCE = 300;
+
+  try {
+    const began = Date.now();
+    await assert.rejects(
+      socksConnect({
+        through: { host: "127.0.0.1", port },
+        to: { host: OPEN_HOST, port: 443 },
+        patience: PATIENCE,
+      }),
+      /did not answer within/,
+      "a silent SOCKS proxy has to fail with a reason, not wait for ever",
+    );
+    const took = Date.now() - began;
+    assert.ok(took < PATIENCE * 8, `it must give up on its own clock, took ${took}ms`);
+  } finally {
+    for (const socket of held) socket.destroy();
+    mute.close();
   }
 });

@@ -4,7 +4,7 @@ import { NOTHING_READ, type Exchange, type RequestFacts } from "./exchange.ts";
 import type { TokenCounts } from "../../tokens/index.ts";
 import type { SocksCredentials } from "../../socks/index.ts";
 import { openGate, type Gate } from "./gate.ts";
-import { THE_PROXY_HAS_THIS_LONG } from "./dial.ts";
+import { routeFrom, type Route } from "./dial.ts";
 import { openPool, type Pool } from "./pool.ts";
 
 /** Something the relay wants said out loud rather than swallowed. */
@@ -34,13 +34,57 @@ export type RelayNotice = {
      * a spent allowance, but a Payer changing without the user asking is exactly
      * the kind of thing they must be able to read afterwards.
      */
-    | "moved-on";
+    | "moved-on"
+    /**
+     * Every turn taken and a queue behind them, for long enough to be a state
+     * rather than a burst.
+     *
+     * The only notice here that is not about one exchange, and the reason it
+     * exists is that a full gate is the one failure this relay could not report.
+     * Every other kind is written when something fails; a gate at its bound fails
+     * nothing, it just stops starting work, so the relay went quiet in exactly
+     * the way a healthy idle relay goes quiet. On 2026-08-30 that cost
+     * twenty-three minutes in which the log, the page and `relay status` all
+     * agreed nothing was wrong.
+     */
+    | "gate-is-full";
   /** One plain sentence, fit to show a user as it stands. */
   readonly summary: string;
 };
 
 /** The deadlock guard, deliberately far above any honest think time. */
 const THREE_MINUTES = 180_000;
+
+/**
+ * The longest one exchange may hold its turn, whatever it is doing.
+ *
+ * Sized from what the guards below it already allow rather than from taste:
+ * three attempts, each able to wait out the full silence guard, is nine minutes,
+ * so anything under that would be this clock overruling those instead of
+ * backstopping them.
+ */
+export const A_TURN_MAY_BE_HELD = 600_000;
+
+/**
+ * How many exchanges may exist at once, streaming and all.
+ *
+ * The gate bounds dials, because a burst of dials is what collapsed the route on
+ * 2026-08-22. This bounds what a dial turns into, and it is a different number
+ * for a different reason: descriptors and memory, not the proxy's patience.
+ *
+ * Forty-eight, and measured rather than chosen. launchd hands this service a soft
+ * limit of 256 descriptors (`launchctl limit maxfiles`, 2026-08-30) and the relay
+ * holds 42 of them at idle. An exchange costs two, one to the caller and one to
+ * the upstream, so forty-eight is 96 against 214 free, leaving room for the pool's
+ * warm sockets and for the per-Seat multiplier below. Memory is the other wall:
+ * a held body may be 4MB, so this is also a cap of 192MB on bodies in hand.
+ *
+ * The multiplier is worth stating rather than implying: the pool keeps an agent
+ * per Seat, so its socket bound is per Seat, not global. In ordinary use one Seat
+ * pays at a time and the two are the same number. A machine somehow streaming
+ * from several Seats at once would want this lower, not higher.
+ */
+export const AT_MOST_EXCHANGES = 48;
 
 /**
  * How many times one request may be sent, counting the first.
@@ -226,6 +270,14 @@ export type RelayConfig = {
    */
   readonly atMostInFlight?: number;
   /**
+   * How many exchanges may exist at once, counting the ones only streaming.
+   *
+   * Defaults to forty-eight. This is the bound on descriptors and memory; the one
+   * that protects the route is `atMostInFlight`, and they are deliberately not the
+   * same number.
+   */
+  readonly atMostExchanges?: number;
+  /**
    * How long an exchange may go with no bytes at all before it is given up on.
    *
    * A guard against a turn never being handed back, not a limit on how long a
@@ -234,6 +286,14 @@ export type RelayConfig = {
    * requests. Defaults to three minutes.
    */
   readonly silentFor?: number;
+  /**
+   * The longest one exchange may hold its turn, whatever it is doing.
+   *
+   * Only a test moves this. It is the backstop behind every named guard, so a
+   * caller that shortens it in real use is choosing to cut honest exchanges to
+   * catch a stall the other clocks were already going to catch.
+   */
+  readonly aTurnMayBeHeld?: number;
   /**
    * How long the machine's proxy has to open a tunnel before it counts as gone.
    *
@@ -268,24 +328,34 @@ export type RelayConfig = {
   readonly idleForAtMostMs?: number;
 };
 
-/** The parts of the configuration the internals need, with defaults filled in. */
-export type Wiring = {
+/**
+ * The parts of the configuration the internals need, with defaults filled in.
+ *
+ * A `Route` and everything else. How traffic leaves is not a field of this type
+ * any more, it is the whole of another one, because the relay is no longer the
+ * only thing that has to answer it: see `Route` in `internal/dial.ts`.
+ */
+export type Wiring = Route & {
   readonly chargeFor: (request: RequestShape) => Decision | Promise<Decision>;
   readonly reportExchange: (exchange: Exchange) => void;
   readonly reportFinished: (exchange: Exchange, tokens: TokenCounts | null) => void;
   readonly openHost: string;
   readonly certificate: { readonly key: string; readonly cert: string };
-  /** Asked per dial, so a proxy that appears or disappears is noticed. */
-  readonly egressNow: () => Promise<Egress>;
-  readonly whenTheProxyIsGone: "refuse" | "go-direct";
-  readonly dial: Dial;
   readonly trust: readonly string[] | null;
-  readonly report: (notice: RelayNotice) => void;
   readonly gate: Gate;
+  /**
+   * The looser bound: how many exchanges may exist at once, streaming included.
+   *
+   * The gate above bounds dials, and a dial is over in about a second. This
+   * bounds the whole life of an exchange, which on this traffic is thirty
+   * seconds, so it is the one that decides how much memory and how many
+   * descriptors the relay can be holding at any moment.
+   */
+  readonly exchanges: Gate;
   /** Connections to the opened host, kept warm and reused. One per Seat. */
   readonly pool: Pool;
   readonly silentFor: number;
-  readonly proxyHasThisLong: number;
+  readonly aTurnMayBeHeld: number;
   readonly whenRefused: (refused: Exchange, request: RequestShape) => Promise<Charge | null> | Charge | null;
   readonly atMostAttempts: number;
 };
@@ -398,15 +468,23 @@ export function wiringFrom(config: RelayConfig, listening: Address): Wiring {
         };
 
   const wiring: Wiring = {
+    // The five route answers, filled in by the one function that owns their
+    // defaults, so the relay and the usage refresher cannot drift apart on them.
+    ...routeFrom({
+      egress: egressNow,
+      report,
+      ...(config.dial === undefined ? {} : { dial: config.dial }),
+      ...(config.whenTheProxyIsGone === undefined ? {} : { whenTheProxyIsGone: config.whenTheProxyIsGone }),
+      ...(config.proxyHasThisLong === undefined ? {} : { proxyHasThisLong: config.proxyHasThisLong }),
+    }),
     gate: openGate(config.atMostInFlight),
+    exchanges: openGate(config.atMostExchanges ?? AT_MOST_EXCHANGES),
     // Filled in below: the pool needs the wiring to know how traffic leaves, and
     // the wiring needs the pool to hand a connection out. One of them has to be
     // second, and it is this one.
     pool: undefined as unknown as Pool,
-    egressNow,
-    whenTheProxyIsGone: config.whenTheProxyIsGone ?? "refuse",
     silentFor: config.silentFor ?? THREE_MINUTES,
-    proxyHasThisLong: config.proxyHasThisLong ?? THE_PROXY_HAS_THIS_LONG,
+    aTurnMayBeHeld: config.aTurnMayBeHeld ?? A_TURN_MAY_BE_HELD,
     whenRefused: config.whenRefused ?? (() => null),
     atMostAttempts: Math.max(1, config.atMostAttempts ?? AT_MOST_ATTEMPTS),
     chargeFor: config.chargeFor ?? (() => NOTHING_DECIDED),
@@ -414,9 +492,7 @@ export function wiringFrom(config: RelayConfig, listening: Address): Wiring {
     reportFinished: config.onExchangeFinished ?? (() => {}),
     openHost: config.openHost,
     certificate: config.certificate,
-    dial: config.dial ?? ((host, port) => ({ host, port })),
     trust: config.trust ?? null,
-    report,
   };
 
   pool = openPool({

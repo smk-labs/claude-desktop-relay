@@ -43,7 +43,8 @@ import { appendFileSync, rmSync } from "node:fs";
 
 import { askOutLoud, askSecretly, stopAsking } from "../src/ask/index.ts";
 import { backUpEveryHeldSeat } from "../src/backup/index.ts";
-import { relayHome } from "../src/home/index.ts";
+import { relayHome, THE_USERS_DESKTOP_FOLDER } from "../src/home/index.ts";
+import { findProfiles } from "../src/profiles/index.ts";
 import { readJsonFile, writeJsonFile } from "../src/json-file/index.ts";
 import { readChoice, writeChoice } from "../src/payer/index.ts";
 import { machineVault, openSeatStore, type ListedSeat, type Seat } from "../src/seats/index.ts";
@@ -189,8 +190,27 @@ async function whatIsOwned(): Promise<Owned> {
     return { wanted: saved.seats, dropped: saved.dropped ?? [], guessed: saved.guessed ?? [] };
   }
 
-  say(`Reading your own Stats logins in ${loginsFolder}...`);
-  const read = await readAccounts({ folder: loginsFolder, alsoKept: true });
+  /**
+   * The snapshot folder, and the Claude Desktop Windows on this machine.
+   *
+   * `relay refresh` has always read both and this read only the folder, so the two
+   * commands disagreed about which accounts exist. The cost was silent and it was
+   * paid: an account signed into a Window here, but absent from a folder frozen
+   * weeks ago, was invisible to the one flow whose whole job is finding accounts.
+   * A Seat cannot be filled by a sitting that cannot see it.
+   *
+   * Read only, and a Window holding no login is reported unread rather than
+   * stopping the run, exactly as in `refresh`.
+   */
+  const found = await findProfiles({ port: home.port }).catch(() => []);
+  const alsoProfiles = [
+    THE_USERS_DESKTOP_FOLDER,
+    home.appSupport,
+    ...found.filter((one) => one.signedIn).map((one) => one.folder),
+  ].filter((one, which, all) => all.indexOf(one) === which);
+
+  say(`Reading your own Stats logins in ${loginsFolder}, and the Windows on this machine...`);
+  const read = await readAccounts({ folder: loginsFolder, alsoProfiles, alsoKept: true });
   const { wanted, dropped, guessed } = seatsFrom(read.accounts);
 
   for (const one of read.unread) complain(`  could not read the Stats login "${one.profile}": ${one.because}`);

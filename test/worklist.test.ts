@@ -206,6 +206,58 @@ test("a Seat listed without its Send token counts as missing, not as filled", ()
   assert.equal(worklist.strays.length, 0, "it is on the Worklist, so it is not a stray");
 });
 
+/**
+ * The ordinary case since Stats logins come from more than one place.
+ *
+ * An account signed into a Claude Desktop Window here, and also present in the
+ * snapshot folder, is read from both. A name is derived from the account and the
+ * Organization, so those two readings derive the same name by construction. The
+ * flow used to refuse to run at all until somebody renamed a Seat by hand, which
+ * is refusing because two sources agree.
+ */
+test("one Seat read from two Stats logins is one Seat, not a collision", () => {
+  const acme = { id: "a1b2c3d4-0000-4000-8000-000000000001", label: "Acme" };
+  const twice = buildWorklist({
+    wanted: [
+      { name: "ana-acme-a1b2", account: "ana@example.com", organization: acme, multiplier: 6.25 },
+      { name: "ana-acme-a1b2", account: "ana@example.com", organization: acme, multiplier: 6.25 },
+    ],
+    held: [],
+  });
+  assert.equal(twice.entries.length, 1);
+
+  // A reading that could not say what the Seat is worth loses to one that could,
+  // whichever order they arrive in.
+  const guessedFirst = buildWorklist({
+    wanted: [
+      // 1 is the stand-in a reading that could not say what a Seat is worth gets.
+      { name: "ana-acme-a1b2", account: "ana@example.com", organization: acme, multiplier: 1 },
+      { name: "ana-acme-a1b2", account: "ana@example.com", organization: acme, multiplier: 6.25 },
+    ],
+    held: [],
+  });
+  assert.equal(guessedFirst.entries.length, 1);
+  assert.equal(guessedFirst.entries[0]?.seat.multiplier, 6.25);
+
+  // Same name, same account, a different Organization is still a real collision.
+  assert.throws(
+    () =>
+      buildWorklist({
+        wanted: [
+          { name: "ana-acme-a1b2", account: "ana@example.com", organization: acme, multiplier: 1 },
+          {
+            name: "ana-acme-a1b2",
+            account: "ana@example.com",
+            organization: { id: "b2c3d4e5-0000-4000-8000-000000000002", label: "Acme-2" },
+            multiplier: 1,
+          },
+        ],
+        held: [],
+      }),
+    /ana-acme-a1b2/,
+  );
+});
+
 test("two Seats that would share a name stop the Worklist rather than quietly becoming one", () => {
   const same = { id: "a1b2c3d4-0000-4000-8000-000000000001", label: "Acme" };
 

@@ -33,5 +33,7 @@ export {
  * key to leave this module. A fingerprint answers "the same one?" and is far too
  * little to be one.
  */
+export type { Unread, WhatCanBeBackedUp } from "./internal/for-backup.ts";
+export { statsLoginsToBackUp } from "./internal/for-backup.ts";
 export type { LoginThere } from "./internal/there.ts";
 export { loginIn } from "./internal/there.ts";

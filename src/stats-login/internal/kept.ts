@@ -2,7 +2,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
 
-import { protectAll, unprotectAll } from "../../dpapi/index.ts";
+import { DPAPI_AVAILABLE, protectAll, unprotectAll } from "../../dpapi/index.ts";
 import { readJsonFile, writeJsonFile } from "../../json-file/index.ts";
 
 /**
@@ -27,6 +27,54 @@ import { readJsonFile, writeJsonFile } from "../../json-file/index.ts";
  */
 export const WHERE_STATS_LOGINS_ARE_KEPT = join(homedir(), ".claude-desktop-relay-secrets", "stats-logins.json");
 
+/**
+ * The mark on a login this machine could not lock, and why one exists at all.
+ *
+ * Windows has `CryptProtectData` and this file was written for it. macOS and
+ * Linux have nothing a relay started from a boot job can reach: the Keychain and
+ * the login keyring are both unlocked by a desktop session, so a store that used
+ * one would work at a screen and fail in a service. That is the same wall
+ * `linux/internal/file-vault.ts` hit for the Send tokens, and it is answered the
+ * same way here, with the same cost stated rather than hidden.
+ *
+ * So off Windows a kept login is base64 and nothing more. What protects it is the
+ * file: 0600 inside a 0700 directory, written through `writeJsonFile`. Anything
+ * running as this user, and root, can read it. Another user on the machine
+ * cannot, and a backup of the home directory carries it.
+ *
+ * The mark travels with the value rather than being assumed from the machine,
+ * because these files now move between machines. A store carried from Windows to
+ * Ubuntu holds blobs only Windows can open, and this is what lets the reader say
+ * so per login instead of failing on all of them.
+ */
+const NOT_LOCKED = "plain:";
+
+async function lockAll(secrets: readonly string[]): Promise<(string | null)[]> {
+  if (DPAPI_AVAILABLE) return protectAll(secrets);
+  return secrets.map((secret) => NOT_LOCKED + Buffer.from(secret, "utf8").toString("base64"));
+}
+
+/**
+ * Open what this machine can, and answer null for the rest.
+ *
+ * Null rather than a throw, and per login rather than for the file, because one
+ * blob this machine cannot open is not a reason to lose the ten beside it that it
+ * can. That rule was already here for a login belonging to another Windows
+ * account; carrying a store between machines is the second way to meet it.
+ */
+async function openAll(blobs: readonly string[]): Promise<(string | null)[]> {
+  const opened: (string | null)[] = blobs.map((blob) =>
+    blob.startsWith(NOT_LOCKED) ? Buffer.from(blob.slice(NOT_LOCKED.length), "base64").toString("utf8") : null,
+  );
+
+  const windowsOnes = blobs.map((blob, at) => ({ blob, at })).filter((one) => !one.blob.startsWith(NOT_LOCKED));
+  if (windowsOnes.length === 0 || !DPAPI_AVAILABLE) return opened;
+
+  const unlocked = await unprotectAll(windowsOnes.map((one) => one.blob));
+  windowsOnes.forEach((one, index) => (opened[one.at] = unlocked[index] ?? null));
+  return opened;
+}
+
 /** One kept login: the name it was read under, and the login itself. */
 export type KeptLogin = { readonly profile: string; readonly statsLogin: string };
 
@@ -43,7 +91,7 @@ export async function keptStatsLogins(file: string = WHERE_STATS_LOGINS_ARE_KEPT
   const names = Object.keys(held?.logins ?? {});
   if (names.length === 0) return [];
 
-  const opened = await unprotectAll(names.map((name) => held?.logins[name] ?? ""));
+  const opened = await openAll(names.map((name) => held?.logins[name] ?? ""));
   const kept: KeptLogin[] = [];
   names.forEach((profile, index) => {
     const statsLogin = opened[index];
@@ -64,7 +112,7 @@ export async function keepStatsLogins(
 ): Promise<number> {
   if (logins.length === 0) return 0;
 
-  const locked = await protectAll(logins.map((one) => one.statsLogin));
+  const locked = await lockAll(logins.map((one) => one.statsLogin));
   const held = (await readJsonFile<OnDisk>(file).catch(() => null))?.logins ?? {};
   const logins_: Record<string, string> = { ...held };
 

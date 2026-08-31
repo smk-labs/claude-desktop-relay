@@ -9,8 +9,14 @@
  *
  * The archive is encrypted with a passphrase the user gives, is written so only
  * they can read it, and never lands inside this repository.
+ *
+ * It carries the Stats logins too, for the same reason and under the same
+ * passphrase. A Send token pays and can say nothing about a plan, so an archive
+ * of tokens alone restores a machine that bills correctly and reports "not known"
+ * on every row. Those logins live in Claude Desktop profiles, and profiles do not
+ * travel between machines.
  */
-export type { Backup, BackedUpSeat } from "./internal/archive.ts";
+export type { Backup, BackedUpSeat, BackedUpStatsLogin } from "./internal/archive.ts";
 /**
  * Backing up every held Seat, and the note beside the archive.
  *
